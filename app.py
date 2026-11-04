@@ -1,96 +1,96 @@
 import json
 import os
 import re
+import tempfile
 from typing import Any
 
+import fitz
 import streamlit as st
+from docx import Document
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-import fitz  # PyMuPDF
-from docx import Document
 
 load_dotenv()
 
+APP_TITLE = "Resume ATS Analyzer"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MAX_FILE_MB = 10
+SUPPORTED_TYPES = ["pdf", "docx", "txt"]
+
+
 def get_secret(name: str, default: str = "") -> str:
-    """Read a Streamlit secret when deployed, otherwise use an environment variable."""
+    """Read Streamlit Cloud secrets, falling back to environment variables."""
     try:
-        return str(st.secrets.get(name, os.getenv(name, default)))
+        value = st.secrets.get(name, default)
+        return str(value) if value else os.getenv(name, default)
     except Exception:
         return os.getenv(name, default)
 
 
-DEFAULT_MODEL = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
-MAX_FILE_MB = 10
-ALLOWED_TYPES = ["pdf", "docx", "txt"]
-
-st.set_page_config(
-    page_title="Resume ATS Analyzer",
-    page_icon="📄",
-    layout="wide",
-)
-
-SYSTEM_INSTRUCTIONS = """
-You are an expert resume reviewer and applicant-tracking-system (ATS) readiness coach.
-Analyze only the resume text and the job description provided. Do not invent experience,
-skills, qualifications, employers, dates, or achievements. Be constructive and specific.
-
-Return ONLY valid JSON matching this schema:
-{
-  "ats_score": integer from 0 to 100,
-  "score_label": string,
-  "summary": string,
-  "strengths": [string, ...],
-  "issues": [string, ...],
-  "missing_keywords": [string, ...],
-  "matched_keywords": [string, ...],
-  "section_feedback": [{"section": string, "feedback": string}, ...],
-  "improvements": [{"priority": "High|Medium|Low", "change": string, "reason": string, "example": string}, ...],
-  "formatting_tips": [string, ...],
-  "disclaimer": string
-}
-
-Scoring guidance:
-- If a job description is supplied, assess relevance to that specific role: keyword alignment,
-  relevant skills/experience, evidence of impact, and clarity.
-- If no job description is supplied, assess general ATS-readiness: standard sections,
-  readable structure, relevant skills, measurable accomplishments, and clarity.
-- Do not claim to know the score produced by any real ATS. It is an estimate, not a hiring
-  prediction. Penalize missing evidence, not a candidate's identity or personal traits.
-- Missing keywords must be genuinely relevant to the supplied job description. Never advise
-  adding a keyword unless the candidate genuinely has that skill or experience.
-- Examples must be truthful templates or rewrites grounded in the supplied resume. Use
-  placeholders where a metric or fact is missing; never fabricate metrics.
-- Keep the response concise, actionable, and easy to scan.
-"""
-
-
 def extract_resume_text(filename: str, file_bytes: bytes) -> str:
-    """Extract text from PDF, DOCX, or TXT uploads."""
-    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if suffix == "pdf":
+    """Extract text from PDF, DOCX, or TXT resume files."""
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if extension == "pdf":
         with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-            pages = [page.get_text("text") for page in pdf]
-        text = "\n".join(pages)
-    elif suffix == "docx":
-        with tempfile.NamedTemporaryFile(suffix=".docx") as tmp:
-            tmp.write(file_bytes)
-            tmp.flush()
-            document = Document(tmp.name)
-        paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
-        table_text = [
-            " | ".join(cell.text.strip() for cell in row.cells)
-            for table in document.tables
-            for row in table.rows
-        ]
-        text = "\n".join(paragraphs + table_text)
-    elif suffix == "txt":
+            text = "\n".join(page.get_text("text") for page in pdf.pages)
+    elif extension == "docx":
+        with tempfile.NamedTemporaryFile(suffix=".docx") as temp_file:
+            temp_file.write(file_bytes)
+            temp_file.flush()
+            document = Document(temp_file.name)
+            paragraphs = [
+                paragraph.text for paragraph in document.paragraphs
+                if paragraph.text.strip()
+            ]
+            table_rows = []
+            for table in document.tables:
+                for row in table.rows:
+                    table_rows.append(
+                        " | ".join(cell.text.strip() for cell in row.cells)
+                    )
+            text = "\n".join(paragraphs + table_rows)
+    elif extension == "txt":
         text = file_bytes.decode("utf-8-sig", errors="replace")
     else:
-        raise ValueError("Unsupported file type. Upload a PDF, DOCX, or TXT file.")
+        raise ValueError("Unsupported file type. Please upload PDF, DOCX, or TXT.")
 
-    # Normalize whitespace while preserving paragraph boundaries.
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
     if len(text) < 80:
         raise ValueError(
+            "Could not extract enough text from this file. If it is a scanned PDF, "
+            "please OCR it first or upload a DOCX/TXT copy."
+        )
+    return text
+
+
+def parse_model_json(response_text: str) -> dict[str, Any]:
+    """Parse and minimally validate the JSON returned by Gemini."""
+    cleaned = response_text.strip()
+    cleaned = re.sub(r"\A```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```\Z", "", cleaned)
+
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace == -1 or last_brace <= first_brace:
+        raise ValueError("Gemini returned an invalid response. Please try again.")
+
+    result = json.loads(cleaned[first_brace:last_brace + 1])
+    if not isinstance(result, dict):
+        raise ValueError("Gemini response must be a JSON object.")
+
+    score = result.get("ats_score")
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        raise ValueError("Gemini response did not include a numeric ATS score.")
+    result["ats_score"] = max(0, min(100, int(score)))
+
+    list_fields = [
+        "strengths", "issues", "missing_keywords", "matched_keywords",
+        "section_feedback", "improvements", "formatting_tips",
+    ]
+    for field in list_fields:
+        if not isinstance(result.get(field), list):
+            result[field] = []
